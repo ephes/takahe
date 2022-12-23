@@ -1,0 +1,5 @@
+fqdn: "fedi.python-podcast.de"
+deploy_environment: "production"
+postgres_backup: "{{ home_path }}/site/backups/{{ project_name }}db.production.psql.gz"
+username: "{{ project_name }}"
+traefik_host_rule: "Host(`{{ fqdn }}`)"

@@ -1,0 +1,14 @@
+# Contents of /etc/systemd/system/multi-user.target.wants/{{ username }}.service
+[Unit]
+Description={{ username }} stator application
+After=network.target
+
+[Service]
+Type=simple
+Restart=always
+WorkingDirectory={{ site_path }}
+User={{ username }}
+ExecStart={{ site_path }}/stator.sh
+
+[Install]
+WantedBy=multi-user.target
