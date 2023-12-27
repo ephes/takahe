@@ -11,7 +11,6 @@ import httpx
 import sentry_sdk
 from corsheaders.defaults import default_headers
 from pydantic import AnyUrl, BaseSettings, EmailStr, Field, validator
-from sentry_sdk.integrations.django import DjangoIntegration
 
 from takahe import __version__
 
@@ -29,7 +28,7 @@ class ImplicitHostname(AnyUrl):
 
 class MediaBackendUrl(AnyUrl):
     host_required = False
-    allowed_schemes = {"s3", "gs", "local"}
+    allowed_schemes = {"s3", "s3-insecure", "gs", "local"}
 
 
 def as_bool(v: str | list[str] | None):
@@ -144,13 +143,16 @@ class Settings(BaseSettings):
     CACHES_DEFAULT: CacheBackendUrl | None = None
 
     # How long to wait, in days, until remote posts/profiles are pruned from
-    # our database if nobody local has interacted with them. Must be in rough
-    # multiples of two weeks.
-    REMOTE_PRUNE_HORIZON: int = 60
+    # our database if nobody local has interacted with them.
+    # Set to zero to disable.
+    REMOTE_PRUNE_HORIZON: int = 90
 
     # Stator tuning
-    STATOR_CONCURRENCY: int = 50
-    STATOR_CONCURRENCY_PER_MODEL: int = 15
+    STATOR_CONCURRENCY: int = 20
+    STATOR_CONCURRENCY_PER_MODEL: int = 4
+
+    # If user migration is allowed (off by default until outbound is done)
+    ALLOW_USER_MIGRATION: bool = False
 
     # Web Push keys
     # Generate via https://web-push-codelab.glitch.me/
@@ -368,7 +370,9 @@ if SETUP.USE_PROXY_HEADERS:
 
 
 if SETUP.SENTRY_DSN:
+    from sentry_sdk.integrations.django import DjangoIntegration
     from sentry_sdk.integrations.httpx import HttpxIntegration
+    from sentry_sdk.integrations.logging import LoggingIntegration
 
     sentry_experiments = {}
 
@@ -382,6 +386,7 @@ if SETUP.SENTRY_DSN:
         integrations=[
             DjangoIntegration(),
             HttpxIntegration(),
+            LoggingIntegration(),
         ],
         traces_sample_rate=SETUP.SENTRY_TRACES_SAMPLE_RATE,
         sample_rate=SETUP.SENTRY_SAMPLE_RATE,
@@ -427,7 +432,7 @@ if SETUP.MEDIA_BACKEND:
         if parsed.hostname is not None:
             port = parsed.port or 443
             GS_CUSTOM_ENDPOINT = f"https://{parsed.hostname}:{port}"
-    elif parsed.scheme == "s3":
+    elif (parsed.scheme == "s3") or (parsed.scheme == "s3-insecure"):
         STORAGES["default"]["BACKEND"] = "core.uploads.TakaheS3Storage"
         AWS_STORAGE_BUCKET_NAME = parsed.path.lstrip("/")
         AWS_QUERYSTRING_AUTH = False
@@ -436,8 +441,14 @@ if SETUP.MEDIA_BACKEND:
             AWS_ACCESS_KEY_ID = parsed.username
             AWS_SECRET_ACCESS_KEY = urllib.parse.unquote(parsed.password)
         if parsed.hostname is not None:
-            port = parsed.port or 443
-            AWS_S3_ENDPOINT_URL = f"https://{parsed.hostname}:{port}"
+            if parsed.scheme == "s3-insecure":
+                s3_default_port = 80
+                s3_scheme = "http"
+            else:
+                s3_default_port = 443
+                s3_scheme = "https"
+            port = parsed.port or s3_default_port
+            AWS_S3_ENDPOINT_URL = f"{s3_scheme}://{parsed.hostname}:{port}"
         if SETUP.MEDIA_URL is not None:
             media_url_parsed = urllib.parse.urlparse(SETUP.MEDIA_URL)
             AWS_S3_CUSTOM_DOMAIN = media_url_parsed.hostname

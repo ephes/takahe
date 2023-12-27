@@ -1,5 +1,6 @@
 import base64
 import json
+import logging
 from ssl import SSLCertVerificationError, SSLError
 from typing import Literal, TypedDict, cast
 from urllib.parse import urlparse
@@ -17,6 +18,8 @@ from idna.core import InvalidCodepoint
 from pyld import jsonld
 
 from core.ld import format_ld_date
+
+logger = logging.getLogger(__name__)
 
 
 class VerificationError(BaseException):
@@ -189,7 +192,7 @@ class HttpSignature:
         body: dict | None,
         private_key: str,
         key_id: str,
-        content_type: str = "application/json",
+        content_type: str = "application/activity+json",
         method: Literal["get", "post"] = "post",
         timeout: TimeoutTypes = settings.SETUP.REMOTE_TIMEOUT,
     ):
@@ -258,7 +261,7 @@ class HttpSignature:
                 )
             except SSLError as invalid_cert:
                 # Not our problem if the other end doesn't have proper SSL
-                print(f"{uri} {invalid_cert}")
+                logger.info("Invalid cert on %s %s", uri, invalid_cert)
                 raise SSLCertVerificationError(invalid_cert) from invalid_cert
             except InvalidCodepoint as ex:
                 # Convert to a more generic error we handle
@@ -294,6 +297,8 @@ class LDSignature:
         Verifies a document
         """
         try:
+            # causing side effects to the original document is bad form
+            document = document.copy()
             # Strip out the signature from the incoming document
             signature = document.pop("signature")
             # Create the options document
@@ -321,7 +326,7 @@ class LDSignature:
                 hashes.SHA256(),
             )
         except InvalidSignature:
-            raise VerificationError("Signature mismatch")
+            raise VerificationError("LDSignature mismatch")
 
     @classmethod
     def create_signature(

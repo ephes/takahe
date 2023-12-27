@@ -1,4 +1,6 @@
 import json
+import logging
+import re
 import ssl
 from functools import cached_property
 from typing import Optional
@@ -7,12 +9,14 @@ import httpx
 import pydantic
 import urlman
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.db import models
 
-from core.exceptions import capture_message
 from core.models import Config
 from stator.models import State, StateField, StateGraph, StatorModel
 from users.schemas import NodeInfo
+
+logger = logging.getLogger(__name__)
 
 
 class DomainStates(StateGraph):
@@ -51,6 +55,14 @@ class DomainStates(StateGraph):
         return cls.outdated
 
 
+def _domain_validator(value: str):
+    if not Domain.is_valid_domain(value):
+        raise ValidationError(
+            "%(value)s is not a valid domain",
+            params={"value": value},
+        )
+
+
 class Domain(StatorModel):
     """
     Represents a domain that a user can have an account on.
@@ -69,7 +81,9 @@ class Domain(StatorModel):
     display domains for now, until we start doing better probing.
     """
 
-    domain = models.CharField(max_length=250, primary_key=True)
+    domain = models.CharField(
+        max_length=250, primary_key=True, validators=[_domain_validator]
+    )
     service_domain = models.CharField(
         max_length=250,
         null=True,
@@ -116,6 +130,19 @@ class Domain(StatorModel):
 
     class Meta:
         indexes: list = []
+
+    @classmethod
+    def is_valid_domain(cls, domain: str) -> bool:
+        """
+        Check if a domain is valid, domain must be lowercase
+        """
+        return (
+            re.match(
+                r"^(?:[a-z0-9](?:[a-z0-9-_]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-_]{0,61}[a-z]$",
+                domain,
+            )
+            is not None
+        )
 
     @classmethod
     def get_remote_domain(cls, domain: str) -> "Domain":
@@ -209,13 +236,14 @@ class Domain(StatorModel):
                     and response.status_code < 500
                     and response.status_code not in [401, 403, 404, 406, 410]
                 ):
-                    capture_message(
-                        f"Client error fetching nodeinfo: {str(ex)}",
-                        extras={
-                            "code": response.status_code,
+                    logger.warning(
+                        "Client error fetching nodeinfo: %d %s %s",
+                        response.status_code,
+                        nodeinfo20_url,
+                        ex,
+                        extra={
                             "content": response.content,
                             "domain": self.domain,
-                            "nodeinfo20_url": nodeinfo20_url,
                         },
                     )
                 return None
@@ -223,11 +251,12 @@ class Domain(StatorModel):
             try:
                 info = NodeInfo(**response.json())
             except (json.JSONDecodeError, pydantic.ValidationError) as ex:
-                capture_message(
-                    f"Client error decoding nodeinfo: {str(ex)}",
-                    extras={
+                logger.warning(
+                    "Client error decoding nodeinfo: %s %s",
+                    nodeinfo20_url,
+                    ex,
+                    extra={
                         "domain": self.domain,
-                        "nodeinfo20_url": nodeinfo20_url,
                     },
                 )
                 return None

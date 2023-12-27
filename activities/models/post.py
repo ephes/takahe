@@ -1,5 +1,6 @@
 import datetime
 import json
+import logging
 import mimetypes
 import ssl
 from collections.abc import Iterable
@@ -27,7 +28,7 @@ from activities.models.post_types import (
     PostTypeDataEncoder,
     QuestionData,
 )
-from core.exceptions import ActivityPubFormatError, capture_message
+from core.exceptions import ActivityPubFormatError
 from core.html import ContentRenderer, FediverseHtmlParser
 from core.ld import (
     canonicalise,
@@ -45,10 +46,12 @@ from users.models.identity import Identity, IdentityStates
 from users.models.inbox_message import InboxMessage
 from users.models.system_actor import SystemActor
 
+logger = logging.getLogger(__name__)
+
 
 class PostStates(StateGraph):
     new = State(try_interval=300)
-    fanned_out = State(try_interval=86400 * 14)
+    fanned_out = State(externally_progressed=True)
     deleted = State(try_interval=300)
     deleted_fanned_out = State(delete_after=86400)
 
@@ -580,7 +583,7 @@ class Post(StatorModel):
                 domain=domain,
                 fetch=True,
             )
-            if identity is not None:
+            if identity is not None and not identity.deleted:
                 mentions.add(identity)
         return mentions
 
@@ -883,7 +886,7 @@ class Post(StatorModel):
                 except IntegrityError:
                     # despite previous checks, a parallel thread managed
                     # to create the same object already
-                    post = cls.by_object_uri(object_uri=data["id"])
+                    raise TryAgainLater()
             else:
                 raise cls.DoesNotExist(f"No post with ID {data['id']}", data)
         if update or created:
@@ -896,7 +899,7 @@ class Post(StatorModel):
                 # don't have content, but this shouldn't be a total failure
                 post.content = get_value_or_map(data, "content", "contentMap")
             except ActivityPubFormatError as err:
-                capture_message(f"{err} on {post.url}")
+                logger.warning("%s on %s", err, post.url)
                 post.content = None
             # Document types have names, not summaries
             post.summary = data.get("summary") or data.get("name")
@@ -992,8 +995,10 @@ class Post(StatorModel):
                     try:
                         cls.ensure_object_uri(post.in_reply_to, reason=post.object_uri)
                     except ValueError:
-                        capture_message(
-                            f"Cannot fetch ancestor of Post={post.pk}, ancestor_uri={post.in_reply_to}"
+                        logger.warning(
+                            "Cannot fetch ancestor of Post=%s, ancestor_uri=%s",
+                            post.pk,
+                            post.in_reply_to,
                         )
                 else:
                     parent.calculate_stats()
@@ -1013,7 +1018,7 @@ class Post(StatorModel):
                     response = SystemActor().signed_request(
                         method="get", uri=object_uri
                     )
-                except (httpx.HTTPError, ssl.SSLCertVerificationError):
+                except (httpx.HTTPError, ssl.SSLCertVerificationError, ValueError):
                     raise cls.DoesNotExist(f"Could not fetch {object_uri}")
                 if response.status_code in [404, 410]:
                     raise cls.DoesNotExist(f"No post at {object_uri}")
@@ -1071,7 +1076,7 @@ class Post(StatorModel):
             if data["actor"] != data["object"]["attributedTo"]:
                 raise ValueError("Create actor does not match its Post object", data)
             # Create it, stator will fan it out locally
-            cls.by_ap(data["object"], create=True, update=True)
+            cls.by_ap(data["object"], create=True, update=True, fetch_author=True)
 
     @classmethod
     def handle_update_ap(cls, data):

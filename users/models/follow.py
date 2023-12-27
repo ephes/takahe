@@ -1,9 +1,9 @@
+import logging
 from typing import Optional
 
 import httpx
 from django.db import models, transaction
 
-from core.exceptions import capture_message
 from core.ld import canonicalise, get_str_or_id
 from core.snowflake import Snowflake
 from stator.models import State, StateField, StateGraph, StatorModel
@@ -11,11 +11,13 @@ from users.models.block import Block
 from users.models.identity import Identity
 from users.models.inbox_message import InboxMessage
 
+logger = logging.getLogger(__name__)
+
 
 class FollowStates(StateGraph):
     unrequested = State(try_interval=600)
     pending_approval = State(externally_progressed=True)
-    accepting = State(try_interval=24 * 60 * 60)
+    accepting = State(try_interval=600)
     rejecting = State(try_interval=24 * 60 * 60)
     accepted = State(externally_progressed=True)
     undone = State(try_interval=24 * 60 * 60)
@@ -79,7 +81,9 @@ class FollowStates(StateGraph):
             except httpx.RequestError:
                 return
             return cls.pending_approval
-        # local/remote follow local, check manually_approve
+        # local/remote follow local, check deleted & manually_approve
+        if instance.target.deleted:
+            return cls.rejecting
         if instance.target.manually_approves_followers:
             from activities.models import TimelineEvent
 
@@ -90,6 +94,9 @@ class FollowStates(StateGraph):
     @classmethod
     def handle_accepting(cls, instance: "Follow"):
         if not instance.source.local:
+            # Don't send Accept if remote identity wasn't fetch yet
+            if not instance.source.inbox_uri:
+                return
             # send an Accept object to the source server
             try:
                 instance.target.signed_request(
@@ -275,7 +282,7 @@ class Follow(StatorModel):
         """
         return {
             "type": "Accept",
-            "id": f"{self.target.actor_uri}#accept/{self.id}",
+            "id": f"{self.target.actor_uri}follow/{self.id}/#accept",
             "actor": self.target.actor_uri,
             "object": self.to_ap(),
         }
@@ -286,7 +293,7 @@ class Follow(StatorModel):
         """
         return {
             "type": "Reject",
-            "id": self.uri + "#reject",
+            "id": f"{self.target.actor_uri}follow/{self.id}/#reject",
             "actor": self.target.actor_uri,
             "object": self.to_ap(),
         }
@@ -350,8 +357,8 @@ class Follow(StatorModel):
             try:
                 follow = cls.by_ap(data, create=True)
             except Identity.DoesNotExist:
-                capture_message(
-                    "Identity not found for incoming Follow", extras={"data": data}
+                logger.info(
+                    "Identity not found for incoming Follow", extra={"data": data}
                 )
                 return
             if follow.state == FollowStates.accepted:
@@ -367,9 +374,9 @@ class Follow(StatorModel):
         try:
             follow = cls.by_ap(data["object"])
         except (cls.DoesNotExist, Identity.DoesNotExist):
-            capture_message(
+            logger.info(
                 "Follow or Identity not found for incoming Accept",
-                extras={"data": data},
+                extra={"data": data},
             )
             return
 
@@ -389,9 +396,9 @@ class Follow(StatorModel):
         try:
             follow = cls.by_ap(data["object"])
         except (cls.DoesNotExist, Identity.DoesNotExist):
-            capture_message(
+            logger.info(
                 "Follow or Identity not found for incoming Reject",
-                extras={"data": data},
+                extra={"data": data},
             )
             return
 
@@ -419,8 +426,8 @@ class Follow(StatorModel):
         try:
             follow = cls.by_ap(data["object"])
         except (cls.DoesNotExist, Identity.DoesNotExist):
-            capture_message(
-                "Follow or Identity not found for incoming Undo", extras={"data": data}
+            logger.info(
+                "Follow or Identity not found for incoming Undo", extra={"data": data}
             )
             return
 

@@ -1,3 +1,4 @@
+import logging
 import ssl
 from functools import cached_property, partial
 from typing import Literal, Optional
@@ -11,8 +12,9 @@ from django.utils import timezone
 from django.utils.functional import lazy
 from lxml import etree
 
-from core.exceptions import ActorMismatchError, capture_message
+from core.exceptions import ActorMismatchError
 from core.html import ContentRenderer, FediverseHtmlParser
+from core.json import json_from_response
 from core.ld import (
     canonicalise,
     format_ld_date,
@@ -33,7 +35,10 @@ from core.uris import (
 from stator.exceptions import TryAgainLater
 from stator.models import State, StateField, StateGraph, StatorModel
 from users.models.domain import Domain
+from users.models.inbox_message import InboxMessage
 from users.models.system_actor import SystemActor
+
+logger = logging.getLogger(__name__)
 
 
 class IdentityStates(StateGraph):
@@ -115,12 +120,47 @@ class IdentityStates(StateGraph):
 
     @classmethod
     def handle_deleted(cls, instance: "Identity"):
-        from activities.models import FanOut
+        from activities.models import (
+            FanOut,
+            Post,
+            PostInteraction,
+            PostInteractionStates,
+            PostStates,
+            TimelineEvent,
+        )
+        from users.models import Bookmark, Follow, FollowStates, HashtagFollow, Report
 
         if not instance.local:
             return cls.updated
 
+        # Delete local data
+        TimelineEvent.objects.filter(identity=instance).delete()
+        Bookmark.objects.filter(identity=instance).delete()
+        HashtagFollow.objects.filter(identity=instance).delete()
+        Report.objects.filter(source_identity=instance).delete()
+        # Nullify all fields and fanout
+        instance.name = ""
+        instance.summary = ""
+        instance.metadata = []
+        instance.aliases = []
+        instance.icon_uri = ""
+        instance.discoverable = False
+        instance.image.delete(save=False)
+        instance.icon.delete(save=False)
+        instance.save()
+        cls.targets_fan_out(instance, FanOut.Types.identity_edited)
+        # Delete all posts and interactions
+        Post.transition_perform_queryset(instance.posts, PostStates.deleted)
+        PostInteraction.transition_perform_queryset(
+            instance.interactions, PostInteractionStates.undone
+        )
+        # Fanout the deletion and unfollow from both directions
         cls.targets_fan_out(instance, FanOut.Types.identity_deleted)
+        for follower in Follow.objects.filter(target=instance):
+            follower.transition_perform(FollowStates.rejecting)
+        for following in Follow.objects.filter(source=instance):
+            following.transition_perform(FollowStates.undone)
+
         return cls.deleted_fanned_out
 
     @classmethod
@@ -134,7 +174,7 @@ class IdentityStates(StateGraph):
 
     @classmethod
     def handle_updated(cls, instance: "Identity"):
-        if instance.state_age > Config.system.identity_max_age:
+        if not instance.local and instance.state_age > Config.system.identity_max_age:
             return cls.outdated
 
 
@@ -395,6 +435,8 @@ class Identity(StatorModel):
             domain = domain.domain
         else:
             domain = domain.lower()
+            domain_instance = Domain.get_domain(domain)
+            local = domain_instance.local if domain_instance else local
 
         with transaction.atomic():
             try:
@@ -670,10 +712,11 @@ class Identity(StatorModel):
         """
         Marks the identity and all of its related content as deleted.
         """
-        # Move all posts to deleted
-        from activities.models.post import Post, PostStates
+        from api.models import Authorization, Token
 
-        Post.transition_perform_queryset(self.posts, PostStates.deleted)
+        # Remove all login tokens
+        Authorization.objects.filter(identity=self).delete()
+        Token.objects.filter(identity=self).delete()
         # Remove all users from ourselves and mark deletion date
         self.users.set([])
         self.deleted = timezone.now()
@@ -742,7 +785,7 @@ class Identity(StatorModel):
             except (httpx.HTTPError, ssl.SSLCertVerificationError) as ex:
                 response = getattr(ex, "response", None)
                 if isinstance(ex, httpx.TimeoutException) or (
-                    response and response.status_code in [408, 504]
+                    response and response.status_code in [408, 429, 504]
                 ):
                     raise TryAgainLater() from ex
                 elif (
@@ -799,7 +842,7 @@ class Identity(StatorModel):
             except (httpx.HTTPError, ssl.SSLCertVerificationError) as ex:
                 response = getattr(ex, "response", None)
                 if isinstance(ex, httpx.TimeoutException) or (
-                    response and response.status_code in [408, 504]
+                    response and response.status_code in [408, 429, 504]
                 ):
                     raise TryAgainLater() from ex
                 elif (
@@ -846,7 +889,6 @@ class Identity(StatorModel):
         webfinger if it's available.
         """
         from activities.models import Emoji
-        from users.services import IdentityService
 
         if self.local:
             raise ValueError("Cannot fetch local identities")
@@ -865,30 +907,27 @@ class Identity(StatorModel):
             return False
         status_code = response.status_code
         if status_code >= 400:
-            if status_code in [408, 504]:
+            if status_code in [408, 429, 504]:
                 raise TryAgainLater()
             if status_code == 410 and self.pk:
                 # Their account got deleted, so let's do the same.
                 Identity.objects.filter(pk=self.pk).delete()
             if status_code < 500 and status_code not in [401, 403, 404, 406, 410]:
-                capture_message(
-                    f"Client error fetching actor at {self.actor_uri}: {status_code}",
-                    extras={
-                        "identity": self.pk,
-                        "domain": self.domain_id,
-                        "content": response.content,
-                    },
+                logger.info(
+                    "Client error fetching actor: %d %s", status_code, self.actor_uri
                 )
             return False
+        json_data = json_from_response(response)
+        if not json_data:
+            return False
         try:
-            document = canonicalise(response.json(), include_security=True)
+            document = canonicalise(json_data, include_security=True)
         except ValueError:
             # servers with empty or invalid responses are inevitable
-            capture_message(
-                f"Invalid response fetching actor at {self.actor_uri}",
-                extras={
-                    "identity": self.pk,
-                    "domain": self.domain_id,
+            logger.info(
+                "Invalid response fetching actor %s",
+                self.actor_uri,
+                extra={
                     "content": response.content,
                 },
             )
@@ -947,7 +986,16 @@ class Identity(StatorModel):
                     self.domain = Domain.get_remote_domain(webfinger_domain)
             except TryAgainLater:
                 # continue with original domain when webfinger times out
+                logger.info("WebFinger timed out: %s", self.actor_uri)
                 pass
+            except ValueError as exc:
+                logger.info(
+                    "Can't parse WebFinger: %s %s",
+                    exc.args[0],
+                    self.actor_uri,
+                    exc_info=exc,
+                )
+                return False
         # Emojis (we need the domain so we do them here)
         for tag in get_list(document, "tag"):
             if tag["type"].lower() in ["toot:emoji", "emoji"]:
@@ -972,11 +1020,14 @@ class Identity(StatorModel):
                 with transaction.atomic():
                     self.save()
 
-        # Fetch pinned posts after identity has been fetched and saved
+        # Fetch pinned posts in a followup task
         if self.featured_collection_uri:
-            featured = self.fetch_pinned_post_uris(self.featured_collection_uri)
-            service = IdentityService(self)
-            service.sync_pins(featured)
+            InboxMessage.create_internal(
+                {
+                    "type": "SyncPins",
+                    "identity": self.pk,
+                }
+            )
 
         return True
 

@@ -1,4 +1,6 @@
 import json
+import logging
+from urllib.parse import urldefrag, urlparse
 
 from django.conf import settings
 from django.http import Http404, HttpResponse, HttpResponseBadRequest, JsonResponse
@@ -9,7 +11,6 @@ from django.views.generic import View
 
 from activities.models import Post
 from activities.services import TimelineService
-from core import exceptions
 from core.decorators import cache_page
 from core.ld import canonicalise
 from core.models import Config
@@ -20,10 +21,12 @@ from core.signatures import (
     VerificationFormatError,
 )
 from core.views import StaticContentView
-from stator.exceptions import TryAgainLater
 from takahe import __version__
 from users.models import Identity, InboxMessage, SystemActor
+from users.models.domain import Domain
 from users.shortcuts import by_handle_or_404
+
+logger = logging.getLogger(__name__)
 
 
 class HttpResponseUnauthorized(HttpResponse):
@@ -137,70 +140,123 @@ class Inbox(View):
             return HttpResponseBadRequest("Payload size too large")
         # Load the LD
         document = canonicalise(json.loads(request.body), include_security=True)
+        document_type = document["type"]
+        document_subtype = None
+        if isinstance(document.get("object"), dict):
+            document_subtype = document["object"].get("type")
+
         # Find the Identity by the actor on the incoming item
         # This ensures that the signature used for the headers matches the actor
         # described in the payload.
+        if "actor" not in document:
+            logger.warning("Inbox error: unspecified actor")
+            return HttpResponseBadRequest("Unspecified actor")
+
         identity = Identity.by_actor_uri(document["actor"], create=True, transient=True)
         if (
-            document["type"] == "Delete"
+            document_type == "Delete"
             and document["actor"] == document["object"]
             and identity._state.adding
         ):
             # We don't have an Identity record for the user. No-op
             return HttpResponse(status=202)
 
-        if not identity.public_key:
-            # See if we can fetch it right now
-            try:
-                identity.fetch_actor()
-            except TryAgainLater:
-                exceptions.capture_message(
-                    f"Inbox error: timed out fetching actor {document['actor']}"
-                )
-                return HttpResponse(status=504)
-
-        if not identity.public_key:
-            exceptions.capture_message(
-                f"Inbox error: cannot fetch actor {document['actor']}"
-            )
-            return HttpResponseBadRequest("Cannot retrieve actor")
-
-        # See if it's from a blocked user or domain
-        if identity.blocked or identity.domain.recursively_blocked():
+        # See if it's from a blocked user or domain - without calling
+        # fetch_actor, which would fetch data from potentially bad actor
+        domain = identity.domain
+        if not domain:
+            actor_url_parts = urlparse(document["actor"])
+            domain = Domain.get_remote_domain(actor_url_parts.hostname)
+        if identity.blocked or domain.recursively_blocked():
             # I love to lie! Throw it away!
-            exceptions.capture_message(
-                f"Inbox: Discarded message from {identity.actor_uri}"
+            logger.info(
+                "Inbox: Discarded message from blocked %s %s",
+                "domain" if domain.recursively_blocked() else "user",
+                identity.actor_uri,
             )
             return HttpResponse(status=202)
 
-        # If there's a "signature" payload, verify against that
-        if "signature" in document:
+        # See if it's a type of message we know we want to ignore right now
+        # (e.g. Lemmy likes/dislikes, which we can't process anyway)
+        if document_type == "Announce" and document_subtype in [
+            "Like",
+            "Dislike",
+            "Create",
+            "Undo",
+            "Update",
+        ]:
+            return HttpResponse(status=202)
+
+        # authenticate HTTP signature first, if one is present and the actor
+        # is already known to us. An invalid signature is an error and message
+        # should be discarded. NOTE: for previously unknown actors, we
+        # don't have their public key yet!
+        if "signature" in request:
             try:
-                LDSignature.verify_signature(document, identity.public_key)
+                if identity.public_key:
+                    HttpSignature.verify_request(
+                        request,
+                        identity.public_key,
+                    )
+                    logger.debug(
+                        "Inbox: %s from %s has good HTTP signature",
+                        document_type,
+                        identity,
+                    )
+                else:
+                    logger.info(
+                        "Inbox: New actor, no key available: %s",
+                        document["actor"],
+                    )
             except VerificationFormatError as e:
-                exceptions.capture_message(
-                    f"Inbox error: Bad LD signature format: {e.args[0]}"
-                )
+                logger.warning("Inbox error: Bad HTTP signature format: %s", e.args[0])
                 return HttpResponseBadRequest(e.args[0])
             except VerificationError:
-                exceptions.capture_message("Inbox error: Bad LD signature")
+                logger.warning("Inbox error: Bad HTTP signature from %s", identity)
                 return HttpResponseUnauthorized("Bad signature")
 
-        # Otherwise, verify against the header (assuming it's the same actor)
-        else:
+        # Mastodon advices not implementing LD Signatures, but
+        # they're widely deployed today. Validate it if one exists.
+        # https://docs.joinmastodon.org/spec/security/#ld
+        if "signature" in document:
             try:
-                HttpSignature.verify_request(
-                    request,
-                    identity.public_key,
+                # signatures are identified by the signature block
+                creator = urldefrag(document["signature"]["creator"]).url
+                creator_identity = Identity.by_actor_uri(
+                    creator, create=True, transient=True
                 )
+                if not creator_identity.public_key:
+                    logger.info("Inbox: New actor, no key available: %s", creator)
+                    # if we can't verify it, we don't keep it
+                    document.pop("signature")
+                else:
+                    LDSignature.verify_signature(document, creator_identity.public_key)
+                    logger.debug(
+                        "Inbox: %s from %s has good LD signature",
+                        document["type"],
+                        creator_identity,
+                    )
             except VerificationFormatError as e:
-                exceptions.capture_message(
-                    f"Inbox error: Bad HTTP signature format: {e.args[0]}"
-                )
+                logger.warning("Inbox error: Bad LD signature format: %s", e.args[0])
                 return HttpResponseBadRequest(e.args[0])
             except VerificationError:
-                exceptions.capture_message("Inbox error: Bad HTTP signature")
-                return HttpResponseUnauthorized("Bad signature")
+                # An invalid LD Signature might also indicate nothing but
+                # a syntactical difference between implementations.
+                # Strip it out if we can't verify it.
+                if "signature" in document:
+                    document.pop("signature")
+                logger.info(
+                    "Inbox: Stripping invalid LD signature from %s %s",
+                    creator_identity,
+                    document["id"],
+                )
+
+        if not ("signature" in request or "signature" in document):
+            logger.debug(
+                "Inbox: %s from %s is unauthenticated. That's OK.",
+                document["type"],
+                identity,
+            )
 
         # Don't allow injection of internal messages
         if document["type"].startswith("__"):

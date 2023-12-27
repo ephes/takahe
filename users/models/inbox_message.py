@@ -26,6 +26,10 @@ class InboxMessageStates(StateGraph):
                 case "block":
                     Block.handle_ap(instance.message)
                 case "announce":
+                    # Ignore Lemmy-specific likes and dislikes for perf reasons
+                    # (we can't parse them anyway)
+                    if instance.message_object_type in ["like", "dislike"]:
+                        return cls.processed
                     PostInteraction.handle_ap(instance.message)
                 case "like":
                     PostInteraction.handle_ap(instance.message)
@@ -139,6 +143,10 @@ class InboxMessageStates(StateGraph):
                             )
                         case "addfollow":
                             IdentityService.handle_internal_add_follow(
+                                instance.message["object"]
+                            )
+                        case "syncpins":
+                            IdentityService.handle_internal_sync_pins(
                                 instance.message["object"]
                             )
                         case unknown:

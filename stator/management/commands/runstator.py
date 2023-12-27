@@ -1,3 +1,4 @@
+import logging
 from typing import cast
 
 from django.apps import apps
@@ -6,6 +7,8 @@ from django.core.management.base import BaseCommand
 from core.models import Config
 from stator.models import StatorModel
 from stator.runner import StatorRunner
+
+logger = logging.getLogger(__name__)
 
 
 class Command(BaseCommand):
@@ -61,6 +64,12 @@ class Command(BaseCommand):
     ):
         # Cache system config
         Config.system = Config.load_system()
+        logging.basicConfig(
+            format="[%(asctime)s] %(levelname)8s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+            level=logging.INFO,
+            force=True,
+        )
         # Resolve the models list into names
         models = cast(
             list[type[StatorModel]],
@@ -73,7 +82,9 @@ class Command(BaseCommand):
         if not models:
             models = StatorModel.subclasses
         models = [model for model in models if model not in excluded]
-        print("Running for models: " + " ".join(m._meta.label_lower for m in models))
+        logger.info(
+            "Running for models: " + " ".join(m._meta.label_lower for m in models)
+        )
         # Run a runner
         runner = StatorRunner(
             models,
@@ -85,4 +96,4 @@ class Command(BaseCommand):
         try:
             runner.run()
         except KeyboardInterrupt:
-            print("Ctrl-C received")
+            logger.critical("Ctrl-C received")

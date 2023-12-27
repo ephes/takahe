@@ -24,7 +24,6 @@ class AdminSettingsPage(SettingsPage):
 
 
 class BasicSettings(AdminSettingsPage):
-
     section = "basic"
 
     options = {
@@ -38,6 +37,10 @@ class BasicSettings(AdminSettingsPage):
         "post_length": {
             "title": "Maximum Post Length",
             "help_text": "The maximum number of characters allowed per post",
+        },
+        "max_media_attachments": {
+            "title": "Maximum Media Attachments",
+            "help_text": "The maximum number of media attachments allowed per post.\nA value other than 4 may be unsupported by clients.",
         },
         "post_minimum_interval": {
             "title": "Minimum Posting Interval",
@@ -130,6 +133,7 @@ class BasicSettings(AdminSettingsPage):
         ],
         "Posts": [
             "post_length",
+            "max_media_attachments",
             "post_minimum_interval",
             "content_warning_text",
             "hashtag_unreviewed_are_public",
@@ -155,7 +159,6 @@ cache_field_defaults = {
 
 
 class TuningSettings(AdminSettingsPage):
-
     section = "tuning"
 
     options = {
@@ -196,7 +199,6 @@ class TuningSettings(AdminSettingsPage):
 
 
 class PoliciesSettings(AdminSettingsPage):
-
     section = "policies"
 
     options = {
