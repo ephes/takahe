@@ -14,6 +14,11 @@
     - name: "Include public vars"
       include_vars: vars.yml
 
+    - name: Install apt requirements
+      apt:
+        name:
+          - libmemcached-dev # for pylibmc
+
     - name: Add the unix user with a bash shell
       user:
         name: "{{ username }}"
