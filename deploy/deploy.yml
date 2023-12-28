@@ -18,6 +18,7 @@
       apt:
         name:
           - libmemcached-dev # for pylibmc
+          - libjpeg-dev  # for pillow
 
     - name: Add the unix user with a bash shell
       user:
