@@ -337,10 +337,14 @@ class ContentRenderer:
         """
         if not html:
             return ""
+        try:
+            uri_domain = None if self.local else post.author.domain.uri_domain
+        except AttributeError as e:
+            uri_domain = None
         parser = FediverseHtmlParser(
             html,
             mentions=post.mentions.all(),
-            uri_domain=(None if self.local else post.author.domain.uri_domain),
+            uri_domain=uri_domain,
             find_hashtags=True,
             find_emojis=self.local,
             emoji_domain=post.author.domain,
